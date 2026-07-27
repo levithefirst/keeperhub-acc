@@ -121,7 +121,13 @@ export function buildNodes(params, network, watchAddress, receiver) {
       position: { x: 0, y: 300 },
       data: {
         label: "Balance Gate", description: `only proceed if balance > ${params.balance_threshold_eth} ETH`, type: "condition",
-        config: { left: "{{@check-balance:Check Balance.balance}}", operator: ">", right: params.balance_threshold_eth }, status: "idle",
+        config: {
+          logicalOperator: "AND",
+          conditions: [
+            { left: "{{@check-balance:Check Balance.balance}}", operator: ">", right: parseFloat(params.balance_threshold_eth) },
+          ],
+        },
+        status: "idle",
       },
     },
     {

@@ -382,4 +382,4 @@ export function mountBuyerRoutes(app, { guard, logRun, apiKey } = {}) {
   });
 }
 
-export { REFERENCE_SLUG, BASE_USDC, DEFAULT_SWEEP, lanesAvailable, probeSweep };
+export { REFERENCE_SLUG, BASE_USDC, DEFAULT_SWEEP, lanesAvailable };

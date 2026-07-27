@@ -72,16 +72,14 @@ app.get("/run/pipeline-test", async (req, res) => {
   const trace = [];
   const run = await logRun({ kind: "pipeline_test", status: "started", request: { TEST_ADDRESS, TEST_NETWORK } });
   try {
-    const created = await createWorkflow(`pipeline-test-${Date.now()}`, "read-only balance check to prove the loop");
-    trace.push({ step: "create_workflow", status: created.status, body: created.json });
-    if (!created.ok || !created.workflowId) throw new Error(`create_workflow failed (${created.status})`);
     const nodes = [
       { id: "trigger", type: "trigger", position: { x: 0, y: 0 }, data: { label: "Manual Trigger", type: "trigger", config: { triggerType: "Manual" }, status: "idle" } },
       { id: "check-balance", type: "action", position: { x: 0, y: 160 }, data: { label: "Check Balance", type: "action", config: { actionType: "web3/check-balance", network: TEST_NETWORK, address: TEST_ADDRESS }, status: "idle" } },
     ];
-    const patched = await patchWorkflow(created.workflowId, nodes, [{ id: "e1", source: "trigger", target: "check-balance" }]);
-    trace.push({ step: "patch_nodes", status: patched.status, body: patched.json });
-    if (!patched.ok) throw new Error(`patch_nodes failed (${patched.status})`);
+    const edges = [{ id: "e1", source: "trigger", target: "check-balance" }];
+    const created = await createWorkflow(`pipeline-test-${Date.now()}`, "read-only balance check to prove the loop", nodes, edges);
+    trace.push({ step: "create_workflow", status: created.status, body: created.json });
+    if (!created.ok || !created.workflowId) throw new Error(`create_workflow failed (${created.status})`);
     const executed = await executeWorkflow(created.workflowId);
     trace.push({ step: "execute", status: executed.status, body: executed.json });
     if (!executed.ok || !executed.executionId) throw new Error(`execute failed (${executed.status})`);
@@ -218,26 +216,18 @@ app.get("/run/factory", async (req, res) => {
     trace.push({ step: "risk_check", verdict });
     await supabase.from("provenance").update({ status: "risk_checked", risk_verdict: verdict }).eq("id", prov.id);
 
-    // step 3: create + patch, with capped self-healing on failures
+    // step 3: create (with nodes/edges included upfront), capped self-healing on failures
     let workflowId = null;
     for (let attempt = 0; attempt <= 2; attempt++) {
-      const created = await createWorkflow(params.workflow_name + "-" + Date.now().toString(36), params.listing_description.slice(0, 140));
+      const { nodes, edges } = buildNodes(params, TEST_NETWORK, TEST_ADDRESS, RECEIVER_ADDRESS);
+      const created = await createWorkflow(params.workflow_name + "-" + Date.now().toString(36), params.listing_description.slice(0, 140), nodes, edges);
       trace.push({ step: "create_workflow", attempt, status: created.status, body: created.json });
-      if (created.ok && created.workflowId) {
-        const { nodes, edges } = buildNodes(params, TEST_NETWORK, TEST_ADDRESS, RECEIVER_ADDRESS);
-        const patched = await patchWorkflow(created.workflowId, nodes, edges);
-        trace.push({ step: "patch_nodes", attempt, status: patched.status, body: patched.json });
-        if (patched.ok) { workflowId = created.workflowId; break; }
-        if (healLog.length >= 2) break;
-        params = await healParams(params, JSON.stringify(patched.json));
-        healLog.push({ stage: "patch", error: patched.json, patched: params });
-      } else {
-        if (healLog.length >= 2) break;
-        params = await healParams(params, JSON.stringify(created.json));
-        healLog.push({ stage: "create", error: created.json, patched: params });
-      }
+      if (created.ok && created.workflowId) { workflowId = created.workflowId; break; }
+      if (healLog.length >= 2) break;
+      params = await healParams(params, JSON.stringify(created.json));
+      healLog.push({ stage: "create", error: created.json, patched: params });
     }
-    if (!workflowId) throw new Error("create/patch failed after capped heal attempts, see trace");
+    if (!workflowId) throw new Error("create failed after capped heal attempts, see trace");
 
     // step 4: validate (falls through gracefully if REST validate is absent)
     const validated = await validateWorkflow(workflowId);

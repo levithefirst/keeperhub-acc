@@ -215,16 +215,18 @@ export async function pollExecution(executionId, tries = 20) {
   return { finalStatus, statusBody, logs: logs.json };
 }
 
-// publish: MCP tool list_workflow is confirmed; the REST equivalent is the
-// least-verified call in this file. we try the likely REST path and keep the
-// raw response so a 4xx tells us the real field names in one round.
+// publish: discovered via live probe, NOT a separate endpoint. listing is a
+// PATCH on the workflow itself with isListed/listedSlug/price, and the API
+// requires an inputSchema (json-schema object; {"type":"object"} is valid for
+// no-input workflows) — KeeperHub's own 422 error documented this for us.
 export async function listWorkflow(workflowId, params, priceUsd) {
+  const slug = `${params.workflow_name}-${Date.now().toString(36).slice(-4)}`;
   const body = {
-    slug: params.workflow_name,
-    title: params.listing_title,
-    description: params.listing_description,
+    isListed: true,
+    listedSlug: slug,
     price: String(priceUsd),
+    inputSchema: { type: "object" },
   };
-  const r = await kh(`/api/workflows/${workflowId}/list`, "POST", body);
-  return { ...r, requested: body };
+  const r = await kh(`/api/workflows/${workflowId}`, "PATCH", body);
+  return { ...r, requested: body, slug };
 }

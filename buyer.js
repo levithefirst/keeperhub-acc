@@ -34,6 +34,32 @@ function tryJson(str) {
 }
 
 /**
+ * Which payment lanes are actually installed right now.
+ * The v2 packages are optionalDependencies, so absence is a normal state,
+ * not a crash. Knowing this BEFORE paying avoids a wasted attempt.
+ */
+async function lanesAvailable() {
+  const out = { v1: false, v2: false, notes: [] };
+
+  try {
+    await import("x402-fetch");
+    out.v1 = true;
+  } catch (e) {
+    out.notes.push(`v1 lane unavailable (x402-fetch): ${e.message}`);
+  }
+
+  try {
+    await import("@x402/fetch");
+    await import("@x402/evm/exact/client");
+    out.v2 = true;
+  } catch (e) {
+    out.notes.push(`v2 lane unavailable (@x402/fetch + @x402/evm): ${e.message}`);
+  }
+
+  return out;
+}
+
+/**
  * Decide which x402 generation the server speaks, from the raw 402.
  * Returns "v2" | "v1" | "unknown" plus the evidence that decided it.
  */
@@ -84,12 +110,18 @@ export async function probeChallenge({ slug = REFERENCE_SLUG, body = {}, apiKey 
   // v2 puts the challenge in a base64 header
   const headerChallenge = tryB64Json(headers["payment-required"]);
   const detected = detectVersion(res.status, headers, headerChallenge || bodyJson);
+  const lanes = await lanesAvailable();
 
   // pull out the money fields wherever they live
   const offer =
     headerChallenge?.accepted ||
     bodyJson?.accepted ||
     (Array.isArray(bodyJson?.accepts) ? bodyJson.accepts[0] : null);
+
+  const laneReady =
+    detected.version === "v1" ? lanes.v1 :
+    detected.version === "v2" ? lanes.v2 :
+    false;
 
   return {
     stage: "probe",
@@ -98,6 +130,9 @@ export async function probeChallenge({ slug = REFERENCE_SLUG, body = {}, apiKey 
     ms: Date.now() - started,
     detected_version: detected.version,
     detection_evidence: detected.evidence,
+    lanes,
+    lane_ready: laneReady,
+    ready_to_pay: res.status === 402 && laneReady,
     headers,
     body_raw: rawBody,
     body_json: bodyJson,
@@ -150,7 +185,17 @@ async function payV1({ url, body, privateKey, apiKey, maxValueAtomic }) {
 
 async function payV2({ url, body, privateKey, apiKey }) {
   const { privateKeyToAccount } = await import("viem/accounts");
-  const { x402Client, wrapFetchWithPayment } = await import("@x402/fetch");
+
+  let x402Client, wrapFetchWithPayment;
+  try {
+    ({ x402Client, wrapFetchWithPayment } = await import("@x402/fetch"));
+  } catch (e) {
+    throw new Error(
+      `X402-V2-NOT-INSTALLED: @x402/fetch failed to import (${e.message}). ` +
+      `it is an optionalDependency, so a bad version spec skips it silently. ` +
+      `check the installed version on the registry and update package.json.`
+    );
+  }
 
   const account = privateKeyToAccount(privateKey);
   const client = new x402Client();
@@ -169,7 +214,12 @@ async function payV2({ url, body, privateKey, apiKey }) {
   } catch (e) {
     throw new Error(`X402-V2-SCHEME-REGISTER-FAILED: ${e.message}`);
   }
-  if (!registered) throw new Error("X402-V2-SCHEME-REGISTER-FAILED: no known export");
+  if (!registered) {
+    throw new Error(
+      "X402-V2-SCHEME-REGISTER-FAILED: @x402/evm/exact/client exported neither " +
+      "registerExactEvmScheme nor ExactEvmScheme. log Object.keys() of the module."
+    );
+  }
 
   const fetchWithPay = wrapFetchWithPayment(fetch, client);
 
@@ -220,7 +270,7 @@ export async function paidCall({
       error: `EXPECTED-402-GOT-${probe.status}`,
       hint:
         probe.status === 503
-          ? "workflow is listed but not enabled/public. PATCH enabled:true and visibility public first."
+          ? "workflow is listed but not enabled/public. set enabled:true and visibility public first."
           : probe.status === 200
           ? "endpoint returned 200 without payment. it is not a paid listing."
           : "read probe.body_raw",
@@ -244,6 +294,18 @@ export async function paidCall({
     };
   }
 
+  // do not attempt payment on a lane that is not installed
+  const laneOk = version === "v2" ? probe.lanes.v2 : probe.lanes.v1;
+  if (!laneOk) {
+    return {
+      ...trace,
+      ok: false,
+      error: `LANE-NOT-INSTALLED-${version.toUpperCase()}`,
+      lanes: probe.lanes,
+      hint: `server speaks ${version} but that client is not installed. see probe.lanes.notes.`,
+    };
+  }
+
   let result;
   try {
     result = version === "v2"
@@ -262,6 +324,8 @@ export async function paidCall({
     tryB64Json(headers["payment-response"]) ||
     null;
 
+  const txHash = settlement?.transaction || settlement?.txHash || null;
+
   return {
     ...trace,
     ok: res.status >= 200 && res.status < 300,
@@ -269,10 +333,8 @@ export async function paidCall({
     status: res.status,
     buyer_identity: payer,
     settlement,
-    tx_hash: settlement?.transaction || settlement?.txHash || null,
-    tx_link: settlement?.transaction
-      ? `https://basescan.org/tx/${settlement.transaction}`
-      : null,
+    tx_hash: txHash,
+    tx_link: txHash ? `https://basescan.org/tx/${txHash}` : null,
     settle_network: settlement?.network || probe.offer_summary?.network || null,
     price_paid_usdc: price,
     response_headers: headers,
@@ -281,4 +343,4 @@ export async function paidCall({
   };
 }
 
-export { REFERENCE_SLUG, BASE_USDC };
+export { REFERENCE_SLUG, BASE_USDC, lanesAvailable };

@@ -1,6 +1,6 @@
 {
   "name": "keeper-agent",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "self-publishing workflow agent for the KeeperHub Agents Onchain Hackathon. demand evidence -> build -> prove onchain -> sell -> earn.",
   "type": "module",
   "main": "index.js",
@@ -14,6 +14,10 @@
     "@supabase/supabase-js": "^2.45.0",
     "express": "^4.19.2",
     "viem": "^2.21.0",
-    "x402-fetch": "^0.4.0"
+    "x402-fetch": "^1.1.0"
+  },
+  "optionalDependencies": {
+    "@x402/fetch": "^2.3.0",
+    "@x402/evm": "^2.3.0"
   }
 }

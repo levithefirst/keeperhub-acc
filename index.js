@@ -309,7 +309,7 @@ app.get("/run/factory", async (req, res) => {
     const published = listed.ok;
     await supabase.from("provenance").update({
       status: published ? "published" : "self_tested",
-      listing_slug: params.workflow_name,
+      listing_slug: listed.slug,
       price_usd: Number(WORKFLOW_PRICE_USD),
       trace,
       error: published ? null : "listing call did not return ok, raw response kept in trace (likely field-name fix needed)",
@@ -324,10 +324,10 @@ app.get("/run/factory", async (req, res) => {
       workflowId,
       selfTestTx: found.transactionHash || found.txHash || null,
       selfTestTxLink: found.transactionLink || null,
-      listingSlug: params.workflow_name,
+      listingSlug: listed.slug,
       priceUsd: WORKFLOW_PRICE_USD,
       healAttempts: healLog.length,
-      nextStep: published ? `/run/buyer?secret=...&slug=${params.workflow_name}` : "paste the list_workflow trace back into chat",
+      nextStep: published ? `/run/buyer?secret=...&slug=${listed.slug}` : "paste the list_workflow trace back into chat",
       trace,
     });
   } catch (err) {

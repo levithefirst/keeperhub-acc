@@ -1,12 +1,27 @@
-// buyer.js — x402 payer client with runtime protocol-version detection.
-// Pure module: returns a full trace object, persistence stays in index.js.
+// buyer.js — x402 payer client + probe tooling.
+// Prefers v2 (PAYMENT-REQUIRED / PAYMENT-SIGNATURE / PAYMENT-RESPONSE).
+// Falls back to v1 (X-PAYMENT) only when the wire explicitly says v1.
+// Never logs or returns the private key.
 
 const KH_BASE = "https://app.keeperhub.com";
 const BASE_USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
-const REFERENCE_SLUG = "mcp-test"; // KeeperHub's public $0.01 reference workflow
+const REFERENCE_SLUG = "helloworld";
 
-function callUrl(slug) {
-  return `${KH_BASE}/api/mcp/workflows/${slug}/call`;
+const DEFAULT_SWEEP = [
+  "helloworld",
+  "simple-workflow",
+  "eth-price-x402",
+  "token-risk-analysis",
+  "mythos-x402-circle-gateway",
+  "wallet-trust-score-base",
+  "buy-me-a-coffee",
+  "microtip",
+  "checked-transfer-16zk",
+];
+
+function resolveTarget(t) {
+  if (!t) return null;
+  return /^https?:\/\//i.test(t) ? t : `${KH_BASE}/api/mcp/workflows/${t}/call`;
 }
 
 function headersToObject(h) {
@@ -17,84 +32,78 @@ function headersToObject(h) {
 
 function tryB64Json(str) {
   if (!str) return null;
-  try {
-    return JSON.parse(Buffer.from(str, "base64").toString("utf8"));
-  } catch {
-    return null;
-  }
+  try { return JSON.parse(Buffer.from(str, "base64").toString("utf8")); } catch { return null; }
 }
 
 function tryJson(str) {
   if (!str) return null;
-  try {
-    return JSON.parse(str);
-  } catch {
-    return null;
-  }
+  try { return JSON.parse(str); } catch { return null; }
 }
 
-/**
- * Which payment lanes are actually installed right now.
- * The v2 packages are optionalDependencies, so absence is a normal state,
- * not a crash. Knowing this BEFORE paying avoids a wasted attempt.
- */
 async function lanesAvailable() {
   const out = { v1: false, v2: false, notes: [] };
-
-  try {
-    await import("x402-fetch");
-    out.v1 = true;
-  } catch (e) {
-    out.notes.push(`v1 lane unavailable (x402-fetch): ${e.message}`);
-  }
-
+  try { await import("x402-fetch"); out.v1 = true; }
+  catch (e) { out.notes.push(`v1 (x402-fetch): ${e.message}`); }
   try {
     await import("@x402/fetch");
     await import("@x402/evm/exact/client");
     out.v2 = true;
-  } catch (e) {
-    out.notes.push(`v2 lane unavailable (@x402/fetch + @x402/evm): ${e.message}`);
-  }
-
+  } catch (e) { out.notes.push(`v2 (@x402/fetch + @x402/evm): ${e.message}`); }
   return out;
 }
 
-/**
- * Decide which x402 generation the server speaks, from the raw 402.
- * Returns "v2" | "v1" | "unknown" plus the evidence that decided it.
- */
 function detectVersion(status, headers, bodyJson) {
   const evidence = [];
-
   if (headers["payment-required"]) {
-    evidence.push("PAYMENT-REQUIRED response header present");
+    evidence.push("PAYMENT-REQUIRED response header present -> v2");
     return { version: "v2", evidence };
   }
-  if (bodyJson?.x402Version === 2) {
-    evidence.push("body.x402Version === 2");
-    return { version: "v2", evidence };
-  }
-  if (bodyJson?.accepted && !bodyJson?.accepts) {
-    evidence.push("body has singular 'accepted' object (v2 shape)");
+  if (bodyJson?.x402Version === 2 || (bodyJson?.accepted && !bodyJson?.accepts)) {
+    evidence.push("body carries v2 markers");
     return { version: "v2", evidence };
   }
   if (bodyJson?.x402Version === 1 || Array.isArray(bodyJson?.accepts)) {
-    evidence.push("body.x402Version === 1 or accepts[] array present");
+    evidence.push("body carries v1 markers (x402Version 1 or accepts[] array)");
     return { version: "v1", evidence };
   }
-
-  evidence.push(`status ${status}, no recognisable x402 marker`);
+  if (status === 402) {
+    evidence.push("402 with no explicit marker; defaulting v2 (CORS advertises PAYMENT-SIGNATURE)");
+    return { version: "v2", evidence };
+  }
+  evidence.push(`status ${status}, not a payment challenge`);
   return { version: "unknown", evidence };
 }
 
-/**
- * STAGE 0. Hit the endpoint with no payment. Costs nothing. Captures everything.
- */
-export async function probeChallenge({ slug = REFERENCE_SLUG, body = {}, apiKey } = {}) {
-  const url = callUrl(slug);
+function extractOffer(headerChallenge, bodyJson) {
+  const src = headerChallenge || bodyJson;
+  if (!src) return null;
+  if (src.accepted) return src.accepted;
+  if (Array.isArray(src.accepts)) return src.accepts[0];
+  return null;
+}
+
+function summariseOffer(offer) {
+  if (!offer) return null;
+  const amt = offer.maxAmountRequired ?? offer.amount ?? null;
+  return {
+    scheme: offer.scheme ?? null,
+    network: offer.network ?? null,
+    asset: offer.asset ?? null,
+    asset_is_base_usdc: String(offer.asset || "").toLowerCase() === BASE_USDC.toLowerCase(),
+    atomic_amount: amt,
+    human_price_usdc: amt != null && !isNaN(Number(amt)) ? Number(amt) / 1e6 : null,
+    payTo: offer.payTo ?? null,
+    maxTimeoutSeconds: offer.maxTimeoutSeconds ?? null,
+    extra: offer.extra ?? null,
+  };
+}
+
+/** FREE. One unpaid POST. Spends nothing, captures everything. */
+export async function probeChallenge({ slug, url, target, body = {}, apiKey } = {}) {
+  const finalUrl = resolveTarget(target || url || slug || REFERENCE_SLUG);
   const started = Date.now();
 
-  const res = await fetch(url, {
+  const res = await fetch(finalUrl, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -106,26 +115,14 @@ export async function probeChallenge({ slug = REFERENCE_SLUG, body = {}, apiKey 
   const headers = headersToObject(res.headers);
   const rawBody = await res.text();
   const bodyJson = tryJson(rawBody);
-
-  // v2 puts the challenge in a base64 header
   const headerChallenge = tryB64Json(headers["payment-required"]);
   const detected = detectVersion(res.status, headers, headerChallenge || bodyJson);
   const lanes = await lanesAvailable();
-
-  // pull out the money fields wherever they live
-  const offer =
-    headerChallenge?.accepted ||
-    bodyJson?.accepted ||
-    (Array.isArray(bodyJson?.accepts) ? bodyJson.accepts[0] : null);
-
-  const laneReady =
-    detected.version === "v1" ? lanes.v1 :
-    detected.version === "v2" ? lanes.v2 :
-    false;
+  const laneReady = detected.version === "v2" ? lanes.v2 : detected.version === "v1" ? lanes.v1 : false;
 
   return {
     stage: "probe",
-    url,
+    url: finalUrl,
     status: res.status,
     ms: Date.now() - started,
     detected_version: detected.version,
@@ -133,27 +130,97 @@ export async function probeChallenge({ slug = REFERENCE_SLUG, body = {}, apiKey 
     lanes,
     lane_ready: laneReady,
     ready_to_pay: res.status === 402 && laneReady,
+    cf_ray: headers["cf-ray"] || null,
+    server_date: headers["date"] || null,
+    cors_allow_headers: headers["access-control-allow-headers"] || null,
+    cors_expose_headers: headers["access-control-expose-headers"] || null,
     headers,
-    body_raw: rawBody,
+    body_raw: rawBody.slice(0, 4000),
     body_json: bodyJson,
     header_challenge: headerChallenge,
-    offer_summary: offer
-      ? {
-          scheme: offer.scheme,
-          network: offer.network,
-          asset: offer.asset,
-          asset_is_base_usdc:
-            String(offer.asset || "").toLowerCase() === BASE_USDC.toLowerCase(),
-          maxAmountRequired: offer.maxAmountRequired,
-          human_price_usdc: offer.maxAmountRequired
-            ? Number(offer.maxAmountRequired) / 1e6
-            : null,
-          payTo: offer.payTo,
-          maxTimeoutSeconds: offer.maxTimeoutSeconds,
-          extra: offer.extra,
-        }
-      : null,
+    offer_summary: summariseOffer(extractOffer(headerChallenge, bodyJson)),
   };
+}
+
+/** FREE. Probe many targets at once. One page answers "mine or everyone". */
+export async function probeSweep({ targets = DEFAULT_SWEEP, apiKey } = {}) {
+  const started = Date.now();
+  const results = await Promise.all(
+    targets.map(async (t) => {
+      try {
+        const p = await probeChallenge({ target: t, apiKey });
+        return {
+          target: t,
+          status: p.status,
+          version: p.detected_version,
+          price_usdc: p.offer_summary?.human_price_usdc ?? null,
+          payTo: p.offer_summary?.payTo ?? null,
+          network: p.offer_summary?.network ?? null,
+          message: p.body_json?.message || p.body_json?.error || null,
+          cf_ray: p.cf_ray,
+          ms: p.ms,
+        };
+      } catch (e) {
+        return { target: t, status: "FETCH_ERROR", message: e.message };
+      }
+    })
+  );
+
+  const counts = {};
+  for (const r of results) counts[r.status] = (counts[r.status] || 0) + 1;
+  const payable = results.filter((r) => r.status === 402);
+
+  return {
+    stage: "sweep",
+    swept_at: new Date().toISOString(),
+    total: results.length,
+    elapsed_ms: Date.now() - started,
+    status_counts: counts,
+    distinct_error_messages: [...new Set(results.map((r) => r.message).filter(Boolean))],
+    verdict:
+      payable.length > 0
+        ? `PAYABLE: ${payable.length} target(s) returned a real 402.`
+        : counts["503"] === results.length
+        ? "ALL 503: every listed workflow is disabled. KeeperHub creates workflows disabled by default, so this is the platform's default state, not an outage. Evidence for the onboarding writeup."
+        : "MIXED: statuses differ. read the table.",
+    payable_targets: payable,
+    results,
+  };
+}
+
+async function payV2({ url, body, privateKey, apiKey }) {
+  const { privateKeyToAccount } = await import("viem/accounts");
+  let x402Client, wrapFetchWithPayment;
+  try { ({ x402Client, wrapFetchWithPayment } = await import("@x402/fetch")); }
+  catch (e) { throw new Error(`X402-V2-NOT-INSTALLED: ${e.message}`); }
+
+  const account = privateKeyToAccount(privateKey);
+  const client = new x402Client();
+
+  let registered = null;
+  try {
+    const evm = await import("@x402/evm/exact/client");
+    if (typeof evm.registerExactEvmScheme === "function") {
+      evm.registerExactEvmScheme(client, { signer: account });
+      registered = "registerExactEvmScheme({signer})";
+    } else if (evm.ExactEvmScheme) {
+      client.register("eip155:*", new evm.ExactEvmScheme(account));
+      registered = "ExactEvmScheme + client.register";
+    }
+  } catch (e) { throw new Error(`X402-V2-SCHEME-REGISTER-FAILED: ${e.message}`); }
+  if (!registered) throw new Error("X402-V2-SCHEME-REGISTER-FAILED: no known export");
+
+  const fetchWithPay = wrapFetchWithPayment(fetch, client);
+  const res = await fetchWithPay(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+    },
+    body: JSON.stringify(body),
+  });
+
+  return { res, payer: account.address, lane: `v2/@x402/fetch (${registered})` };
 }
 
 async function payV1({ url, body, privateKey, apiKey, maxValueAtomic }) {
@@ -163,12 +230,7 @@ async function payV1({ url, body, privateKey, apiKey, maxValueAtomic }) {
   const { wrapFetchWithPayment } = await import("x402-fetch");
 
   const account = privateKeyToAccount(privateKey);
-  const wallet = createWalletClient({
-    account,
-    transport: http("https://mainnet.base.org"),
-    chain: base,
-  });
-
+  const wallet = createWalletClient({ account, transport: http("https://mainnet.base.org"), chain: base });
   const fetchWithPay = wrapFetchWithPayment(fetch, wallet, maxValueAtomic);
 
   const res = await fetchWithPay(url, {
@@ -183,81 +245,26 @@ async function payV1({ url, body, privateKey, apiKey, maxValueAtomic }) {
   return { res, payer: account.address, lane: "v1/x402-fetch" };
 }
 
-async function payV2({ url, body, privateKey, apiKey }) {
-  const { privateKeyToAccount } = await import("viem/accounts");
-
-  let x402Client, wrapFetchWithPayment;
-  try {
-    ({ x402Client, wrapFetchWithPayment } = await import("@x402/fetch"));
-  } catch (e) {
-    throw new Error(
-      `X402-V2-NOT-INSTALLED: @x402/fetch failed to import (${e.message}). ` +
-      `it is an optionalDependency, so a bad version spec skips it silently. ` +
-      `check the installed version on the registry and update package.json.`
-    );
-  }
-
-  const account = privateKeyToAccount(privateKey);
-  const client = new x402Client();
-
-  // two documented registration shapes; try both before giving up
-  let registered = null;
-  try {
-    const evm = await import("@x402/evm/exact/client");
-    if (typeof evm.registerExactEvmScheme === "function") {
-      evm.registerExactEvmScheme(client, { signer: account });
-      registered = "registerExactEvmScheme";
-    } else if (evm.ExactEvmScheme) {
-      client.register("eip155:*", new evm.ExactEvmScheme(account));
-      registered = "ExactEvmScheme + client.register";
-    }
-  } catch (e) {
-    throw new Error(`X402-V2-SCHEME-REGISTER-FAILED: ${e.message}`);
-  }
-  if (!registered) {
-    throw new Error(
-      "X402-V2-SCHEME-REGISTER-FAILED: @x402/evm/exact/client exported neither " +
-      "registerExactEvmScheme nor ExactEvmScheme. log Object.keys() of the module."
-    );
-  }
-
-  const fetchWithPay = wrapFetchWithPayment(fetch, client);
-
-  const res = await fetchWithPay(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
-    },
-    body: JSON.stringify(body),
-  });
-
-  return { res, payer: account.address, lane: `v2/@x402/fetch (${registered})` };
-}
-
-/**
- * Full paid call. Probes first, then dispatches. Never guesses the version.
- */
+/** SPENDS REAL USDC. Probes first, never guesses the version, caps the amount. */
 export async function paidCall({
-  slug,
+  slug, url, target,
   body = {},
   privateKey = process.env.BUYER_PRIVATE_KEY,
   apiKey = process.env.KEEPERHUB_API_KEY,
-  maxUsd = 1.0,          // hard client-side ceiling. 1 USDC.
-  forceVersion = null,   // "v1" | "v2" to override detection
+  maxUsd = 0.5,
+  forceVersion = null,
 } = {}) {
-  const trace = { stage: "paid_call", slug, started_at: new Date().toISOString() };
+  const finalUrl = resolveTarget(target || url || slug);
+  const trace = { stage: "paid_call", url: finalUrl, started_at: new Date().toISOString() };
 
   if (!privateKey) return { ...trace, ok: false, error: "BUYER_PRIVATE_KEY not set" };
-  if (!slug) return { ...trace, ok: false, error: "slug required" };
+  if (!finalUrl) return { ...trace, ok: false, error: "need a slug or url" };
 
-  const url = callUrl(slug);
   const maxValueAtomic = BigInt(Math.round(maxUsd * 1e6));
 
-  // always probe, even when forcing, so the challenge is on the record
   let probe;
   try {
-    probe = await probeChallenge({ slug, body, apiKey });
+    probe = await probeChallenge({ target: finalUrl, body, apiKey });
     trace.probe = probe;
   } catch (e) {
     return { ...trace, ok: false, error: `PROBE-FAILED: ${e.message}` };
@@ -269,48 +276,31 @@ export async function paidCall({
       ok: false,
       error: `EXPECTED-402-GOT-${probe.status}`,
       hint:
-        probe.status === 503
-          ? "workflow is listed but not enabled/public. set enabled:true and visibility public first."
-          : probe.status === 200
-          ? "endpoint returned 200 without payment. it is not a paid listing."
-          : "read probe.body_raw",
+        probe.status === 503 ? "workflow disabled. run /mcp/enable?id=<workflowId> then retry."
+        : probe.status === 404 ? "target does not exist."
+        : probe.status === 200 ? "returned 200 without payment, not a paid resource."
+        : "read probe.body_raw",
     };
   }
 
   const price = probe.offer_summary?.human_price_usdc;
   if (price != null && price > maxUsd) {
-    return { ...trace, ok: false, error: `PRICE-ABOVE-CAP: ${price} > ${maxUsd}` };
+    return { ...trace, ok: false, error: `PRICE-ABOVE-CAP: ${price} > ${maxUsd} USDC` };
   }
 
   const version = forceVersion || probe.detected_version;
   trace.version_used = version;
 
-  if (version === "unknown") {
-    return {
-      ...trace,
-      ok: false,
-      error: "X402-VERSION-UNDETECTED",
-      hint: "inspect probe.headers and probe.body_raw, then re-run with &force=v1 or &force=v2",
-    };
-  }
-
-  // do not attempt payment on a lane that is not installed
   const laneOk = version === "v2" ? probe.lanes.v2 : probe.lanes.v1;
   if (!laneOk) {
-    return {
-      ...trace,
-      ok: false,
-      error: `LANE-NOT-INSTALLED-${version.toUpperCase()}`,
-      lanes: probe.lanes,
-      hint: `server speaks ${version} but that client is not installed. see probe.lanes.notes.`,
-    };
+    return { ...trace, ok: false, error: `LANE-NOT-INSTALLED-${String(version).toUpperCase()}`, lanes: probe.lanes };
   }
 
   let result;
   try {
-    result = version === "v2"
-      ? await payV2({ url, body, privateKey, apiKey })
-      : await payV1({ url, body, privateKey, apiKey, maxValueAtomic });
+    result = version === "v1"
+      ? await payV1({ url: finalUrl, body, privateKey, apiKey, maxValueAtomic })
+      : await payV2({ url: finalUrl, body, privateKey, apiKey });
   } catch (e) {
     return { ...trace, ok: false, error: `PAYMENT-FAILED: ${e.message}`, stack: e.stack };
   }
@@ -320,11 +310,12 @@ export async function paidCall({
   const rawBody = await res.text();
 
   const settlement =
-    tryB64Json(headers["x-payment-response"]) ||
     tryB64Json(headers["payment-response"]) ||
+    tryB64Json(headers["x-payment-response"]) ||
+    tryB64Json(headers["payment-receipt"]) ||
     null;
 
-  const txHash = settlement?.transaction || settlement?.txHash || null;
+  const txHash = settlement?.transaction || settlement?.txHash || settlement?.transactionHash || null;
 
   return {
     ...trace,
@@ -338,9 +329,57 @@ export async function paidCall({
     settle_network: settlement?.network || probe.offer_summary?.network || null,
     price_paid_usdc: price,
     response_headers: headers,
-    response_body_raw: rawBody,
+    response_body_raw: rawBody.slice(0, 4000),
     response_body_json: tryJson(rawBody),
   };
 }
 
-export { REFERENCE_SLUG, BASE_USDC, lanesAvailable };
+export function mountBuyerRoutes(app, { guard, logRun, apiKey } = {}) {
+  app.get("/x402/sweep", async (req, res) => {
+    if (guard && !guard(req, res)) return;
+    const targets = req.query.targets
+      ? String(req.query.targets).split(",").map((s) => s.trim()).filter(Boolean)
+      : DEFAULT_SWEEP;
+    try { res.json(await probeSweep({ targets, apiKey })); }
+    catch (e) { res.status(500).json({ error: e.message, stack: e.stack }); }
+  });
+
+  app.get("/x402/probe", async (req, res) => {
+    if (guard && !guard(req, res)) return;
+    try {
+      res.json(await probeChallenge({
+        target: req.query.target || req.query.slug || REFERENCE_SLUG,
+        body: req.query.body ? JSON.parse(req.query.body) : {},
+        apiKey,
+      }));
+    } catch (e) { res.status(500).json({ error: e.message, stack: e.stack }); }
+  });
+
+  app.get("/x402/pay", async (req, res) => {
+    if (guard && !guard(req, res)) return;
+    const target = req.query.target || req.query.slug;
+    if (!target) return res.status(400).json({ error: "need ?target=" });
+    try {
+      const out = await paidCall({
+        target,
+        body: req.query.body ? JSON.parse(req.query.body) : {},
+        maxUsd: Number(req.query.max || 0.5),
+        forceVersion: req.query.force || null,
+      });
+      if (logRun) {
+        await logRun({
+          kind: "x402_pay",
+          status: out.ok ? "success" : "error",
+          tx_hash: out.tx_hash || null,
+          tx_link: out.tx_link || null,
+          request: { target },
+          response: out,
+          error: out.error || null,
+        });
+      }
+      res.status(out.ok ? 200 : 502).json(out);
+    } catch (e) { res.status(500).json({ error: e.message, stack: e.stack }); }
+  });
+}
+
+export { REFERENCE_SLUG, BASE_USDC, DEFAULT_SWEEP, lanesAvailable, probeSweep };

@@ -12,7 +12,7 @@
 import express from "express";
 import { createClient } from "@supabase/supabase-js";
 import {
-  kh, deepFind, draftParams, healParams, riskCheck, buildNodes,
+  kh, deepFind, draftParams, healParams, riskCheck, buildNodes, classifyFailure, collectExecutedNodeIds,
   createWorkflow, patchWorkflow, validateWorkflow, executeWorkflow, pollExecution, listWorkflow,
 } from "./pipeline.js";
 import { paidCall } from "./buyer.js";
@@ -216,16 +216,33 @@ app.get("/run/factory", async (req, res) => {
     trace.push({ step: "risk_check", verdict });
     await supabase.from("provenance").update({ status: "risk_checked", risk_verdict: verdict }).eq("id", prov.id);
 
-    // step 3: create (with nodes/edges included upfront), capped self-healing on failures
+    // step 3: create (nodes/edges upfront). failures are CLASSIFIED first:
+    // TEMPLATE errors abort immediately (healing params can't fix the graph),
+    // PARAMETER errors get healed, and every healed draft must re-pass the
+    // risk policy before resubmission.
     let workflowId = null;
     for (let attempt = 0; attempt <= 2; attempt++) {
       const { nodes, edges } = buildNodes(params, TEST_NETWORK, TEST_ADDRESS, RECEIVER_ADDRESS);
       const created = await createWorkflow(params.workflow_name + "-" + Date.now().toString(36), params.listing_description.slice(0, 140), nodes, edges);
       trace.push({ step: "create_workflow", attempt, status: created.status, body: created.json });
       if (created.ok && created.workflowId) { workflowId = created.workflowId; break; }
+
+      const failureClass = classifyFailure(created.json);
+      trace.push({ step: "failure_classification", attempt, class: failureClass });
+      if (failureClass === "TEMPLATE") {
+        healLog.push({ stage: "create", classification: "TEMPLATE", fixable: false, error: created.json });
+        throw new Error("KH-TEMPLATE-MISMATCH: template-level rejection, healing skipped by design (re-drafting parameters cannot fix graph structure), see trace");
+      }
       if (healLog.length >= 2) break;
       params = await healParams(params, JSON.stringify(created.json));
-      healLog.push({ stage: "create", error: created.json, patched: params });
+      healLog.push({ stage: "create", classification: "PARAMETER", fixable: true, error: created.json, patched: params });
+      // healed params must re-pass the risk policy; Claude cannot heal its way past it
+      const reVerdict = riskCheck(params, TEST_NETWORK);
+      trace.push({ step: "risk_recheck_after_heal", attempt, verdict: reVerdict });
+      if (!reVerdict.allowed) {
+        await supabase.from("provenance").update({ status: "failed", risk_verdict: reVerdict, heal_attempts: healLog.length, heal_log: healLog, trace, error: "healed parameters rejected by risk policy" }).eq("id", prov.id);
+        return res.status(403).json({ result: "REFUSED BY RISK POLICY (post-heal)", verdict: reVerdict, trace });
+      }
     }
     if (!workflowId) throw new Error("create failed after capped heal attempts, see trace");
 
@@ -253,15 +270,38 @@ app.get("/run/factory", async (req, res) => {
     trace.push({ step: "self_test_result", finalStatus: result.finalStatus, logs: result.logs });
     const found = deepFind({ s: result.statusBody, l: result.logs }, ["transactionHash", "transactionLink", "txHash"]);
     const selfTestOk = ["success", "completed"].includes(result.finalStatus);
+
+    // step 5b: EXECUTION INTEGRITY CHECK. KeeperHub can accept an invalid node
+    // at create time, silently prune it at runtime, and still report "success"
+    // (we got burned by exactly this). so "success" alone is not proof: compare
+    // the graph we created against the nodes that actually executed.
+    const { nodes: builtNodes } = buildNodes(params, TEST_NETWORK, TEST_ADDRESS, RECEIVER_ADDRESS);
+    const expectedIds = builtNodes.map((n) => n.id);
+    const executedIds = [...collectExecutedNodeIds({ s: result.statusBody, l: result.logs })];
+    const missing = expectedIds.filter((id) => !executedIds.includes(id));
+    const transferRan = executedIds.includes("safe-transfer");
+    const integrity = {
+      expectedNodes: expectedIds,
+      executedNodes: executedIds,
+      missingNodes: missing,
+      transferExecuted: transferRan,
+      pass: missing.length === 0 && transferRan,
+      note: missing.length > 0
+        ? "graph nodes were silently dropped from execution; refusing to publish"
+        : (!transferRan ? "gate evaluated false or transfer skipped; nothing proven onchain, refusing to publish" : "all nodes executed, transfer confirmed"),
+    };
+    trace.push({ step: "integrity_check", integrity });
+
     await supabase.from("provenance").update({
-      status: selfTestOk ? "self_tested" : "failed",
+      status: selfTestOk && integrity.pass ? "self_tested" : "failed",
       selftest_execution_id: String(executed.executionId),
       selftest_tx_hash: found.transactionHash || found.txHash || null,
       selftest_tx_link: found.transactionLink || null,
       trace,
-      error: selfTestOk ? null : `self-test final status ${result.finalStatus}`,
+      error: selfTestOk ? (integrity.pass ? null : `integrity check failed: ${integrity.note}`) : `self-test final status ${result.finalStatus}`,
     }).eq("id", prov.id);
     if (!selfTestOk) throw new Error(`self-test did not succeed (${result.finalStatus}), refusing to publish an unproven workflow`);
+    if (!integrity.pass) throw new Error(`INTEGRITY-FAIL: ${integrity.note} (missing: ${missing.join(", ") || "none"})`);
 
     // step 6: publish at >= $0.05 (KeeperHub's own anti-self-dealing floor)
     const listed = await listWorkflow(workflowId, params, WORKFLOW_PRICE_USD);
@@ -356,8 +396,96 @@ app.get("/provenance/:id", async (req, res) => {
 });
 
 // ============================================================
-// glass box: live view, dark terminal, zero framework
+// discovery: one deploy collapses the remaining unknowns.
+// GET /discover — schema registry, openapi surface, real workflow shapes,
+//                 and the raw 402 challenge from KeeperHub's public listing.
+// GET /debug/kh-proxy — the browser becomes the terminal: probe any
+//                 KeeperHub path without a deploy cycle.
 // ============================================================
+app.get("/discover", async (req, res) => {
+  if (!guard(req, res)) return;
+  const full = req.query.full === "1";
+  const out = {};
+
+  // 1. the schema registry: source of truth for node/action shapes
+  const schemas = await kh("/api/mcp/schemas");
+  if (full) {
+    out.mcp_schemas = { status: schemas.status, body: schemas.json };
+  } else {
+    const raw = JSON.stringify(schemas.json || {});
+    out.mcp_schemas = {
+      status: schemas.status,
+      totalChars: raw.length,
+      topLevelKeys: schemas.json && typeof schemas.json === "object" ? Object.keys(schemas.json) : null,
+      conditionExcerpt: raw.match(/.{0,400}Condition.{0,800}/)?.[0] || "no 'Condition' match found",
+      listingExcerpt: raw.match(/.{0,300}(list_workflow|marketplace|listing).{0,700}/i)?.[0] || "no listing-related match found",
+      workflowStructureExcerpt: raw.match(/.{0,200}(workflowStructure|edgeStructure).{0,900}/)?.[0] || "no structure match found",
+      note: "add &full=1 for the complete raw registry",
+    };
+  }
+
+  // 2. openapi surface, if published
+  try {
+    const oa = await fetch("https://app.keeperhub.com/openapi.json");
+    const oaText = await oa.text();
+    let oaJson; try { oaJson = JSON.parse(oaText); } catch { oaJson = null; }
+    out.openapi = oaJson
+      ? (full ? oaJson : {
+          status: oa.status,
+          pathCount: oaJson.paths ? Object.keys(oaJson.paths).length : 0,
+          paths: oaJson.paths ? Object.keys(oaJson.paths) : [],
+          listingRelated: oaJson.paths ? Object.entries(oaJson.paths).filter(([p]) => /list|market|live|publish/i.test(p)).map(([p, v]) => ({ path: p, methods: Object.keys(v) })) : [],
+        })
+      : { status: oa.status, note: "not json", head: oaText.slice(0, 300) };
+  } catch (e) {
+    out.openapi = { error: String(e).slice(0, 200) };
+  }
+
+  // 3. our existing workflows: real accepted node shapes
+  const wfs = await kh("/api/workflows");
+  const wfArr = Array.isArray(wfs.json) ? wfs.json : wfs.json?.workflows || wfs.json?.data || [];
+  out.workflows = {
+    status: wfs.status,
+    count: Array.isArray(wfArr) ? wfArr.length : "unknown shape, see sample",
+    sample: Array.isArray(wfArr) ? wfArr.slice(0, 5).map((w) => ({ id: w.id, name: w.name, isListed: w.isListed, listedSlug: w.listedSlug })) : wfs.json,
+    note: "use /debug/kh-proxy?path=/api/workflows/<id> to dump one full workflow",
+  };
+
+  // 4. the raw 402 challenge from KeeperHub's own public $0.01 reference listing
+  try {
+    const probe = await fetch("https://app.keeperhub.com/api/mcp/workflows/mcp-test/call", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ inputs: {} }),
+    });
+    const pText = await probe.text();
+    let pJson; try { pJson = JSON.parse(pText); } catch { pJson = { nonJsonBody: pText.slice(0, 1500) }; }
+    const hdrs = {};
+    for (const h of ["www-authenticate", "x-payment-required", "payment-required", "content-type", "x-payment", "accept-payment"]) {
+      const v = probe.headers.get(h);
+      if (v) hdrs[h] = v;
+    }
+    out.x402_challenge_probe = { status: probe.status, headers: hdrs, body: pJson };
+  } catch (e) {
+    out.x402_challenge_probe = { error: String(e).slice(0, 200) };
+  }
+
+  res.json(out);
+});
+
+app.get("/debug/kh-proxy", async (req, res) => {
+  if (!guard(req, res)) return;
+  const { method = "GET", path } = req.query;
+  if (!path || !path.startsWith("/")) return res.status(400).json({ error: "need ?path=/api/... (must start with /)" });
+  let body = null;
+  if (req.query.body) {
+    try { body = JSON.parse(req.query.body); } catch { return res.status(400).json({ error: "?body= must be valid json" }); }
+  }
+  const r = await kh(path, method.toUpperCase(), body);
+  res.json({ probed: { method: method.toUpperCase(), path, body }, status: r.status, response: r.json });
+});
+
+
 app.get("/", (req, res) => {
   res.setHeader("Content-Type", "text/html");
   res.send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>keeper-agent</title>

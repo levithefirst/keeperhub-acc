@@ -130,7 +130,7 @@ export function buildNodes(params, network, watchAddress, receiver) {
       position: { x: 0, y: 450 },
       data: {
         label: "Safe Transfer", description: `send ${params.transfer_amount_eth} ETH only when the gate passes`, type: "action",
-        config: { actionType: "web3/transfer-funds", network: String(network), to: receiver, amount: params.transfer_amount_eth }, status: "idle",
+        config: { actionType: "web3/transfer-funds", network: String(network), recipientAddress: receiver, amount: params.transfer_amount_eth }, status: "idle",
       },
     },
   ];

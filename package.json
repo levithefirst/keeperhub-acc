@@ -1,6 +1,6 @@
 {
   "name": "keeper-agent",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "self-publishing workflow agent for the KeeperHub Agents Onchain Hackathon. demand evidence -> build -> prove onchain -> sell -> earn.",
   "type": "module",
   "main": "index.js",

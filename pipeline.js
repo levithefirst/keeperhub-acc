@@ -143,8 +143,12 @@ export function buildNodes(params, network, watchAddress, receiver) {
 }
 
 // ---------- pipeline steps against KeeperHub ----------
-export async function createWorkflow(name, description) {
-  const r = await kh("/api/workflows/create", "POST", { name, description });
+// KeeperHub's real create endpoint requires name, nodes, and edges together
+// in the initial call (confirmed by the 400 "Name, nodes, and edges are
+// required" response) rather than accepting an empty shell to be patched
+// afterward. nodes/edges are now required params here.
+export async function createWorkflow(name, description, nodes, edges) {
+  const r = await kh("/api/workflows/create", "POST", { name, description, nodes, edges });
   const id = r.json?.id || r.json?.workflow?.id || r.json?.data?.id || r.json?.workflowId;
   return { ...r, workflowId: id };
 }

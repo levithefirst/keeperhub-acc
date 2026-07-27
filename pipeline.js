@@ -117,15 +117,15 @@ export function buildNodes(params, network, watchAddress, receiver) {
     },
     {
       id: "gate",
-      type: "condition",
+      type: "action",
       position: { x: 0, y: 300 },
       data: {
-        label: "Balance Gate", description: `only proceed if balance > ${params.balance_threshold_eth} ETH`, type: "condition",
+        type: "action",
+        label: "Balance Gate",
+        description: `only proceed if balance > ${params.balance_threshold_eth} ETH`,
         config: {
-          logicalOperator: "AND",
-          conditions: [
-            { left: "{{@check-balance:Check Balance.balance}}", operator: ">", right: parseFloat(params.balance_threshold_eth) },
-          ],
+          actionType: "Condition",
+          condition: `{{@check-balance:Check Balance.balance}} > ${parseFloat(params.balance_threshold_eth)}`,
         },
         status: "idle",
       },
@@ -146,6 +146,30 @@ export function buildNodes(params, network, watchAddress, receiver) {
     { id: "e3", source: "gate", target: "safe-transfer", sourceHandle: "true" },
   ];
   return { nodes, edges };
+}
+
+// ---------- failure classification ----------
+// template-level errors (node types, schema, config shape) are NOT fixable by
+// re-drafting parameters. healing them just burns Claude calls against the
+// wrong layer. classify first, heal only what healing can reach.
+export function classifyFailure(errJson) {
+  const text = JSON.stringify(errJson || "").toLowerCase();
+  const templateSignals = [
+    "node", "edge", "actiontype", "action type", "unknown field", "invalid action",
+    "invalid_action_config", "schema", "condition", "sourcehandle", "workflow contains",
+  ];
+  return templateSignals.some((s) => text.includes(s)) ? "TEMPLATE" : "PARAMETER";
+}
+
+// collect every nodeId that appears anywhere in an execution's status/logs,
+// so we can verify which graph nodes actually ran vs were silently dropped.
+export function collectExecutedNodeIds(obj, found = new Set()) {
+  if (!obj || typeof obj !== "object") return found;
+  for (const [k, v] of Object.entries(obj)) {
+    if ((k === "nodeId" || k === "currentNodeId" || k === "lastSuccessfulNodeId") && typeof v === "string" && v) found.add(v);
+    if (typeof v === "object") collectExecutedNodeIds(v, found);
+  }
+  return found;
 }
 
 // ---------- pipeline steps against KeeperHub ----------

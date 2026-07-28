@@ -55,6 +55,7 @@ async function askClaude(system, user) {
   return JSON.parse(clean);
 }
 
+// Claude only fills PARAMETERS. the node graph itself is a fixed template.
 const DRAFT_SYSTEM = `you are a parameter compiler for one fixed KeeperHub workflow template: a "checked transfer" (check wallet balance, and only if it exceeds a threshold, send a tiny transfer). output RAW JSON ONLY, no markdown, no prose, matching exactly:
 {
   "workflow_name": "string, lowercase-hyphens, max 32 chars",
@@ -79,6 +80,8 @@ export async function healParams(previousParams, errorText) {
 }
 
 // ---------- deterministic risk policy ----------
+// the agent refuses to publish anything outside its autonomous budget.
+// this runs in code, not in the LLM, so it cannot be talked out of it.
 const TESTNETS = ["11155111", "84532"];
 export function riskCheck(params, network) {
   const rejections = [];
@@ -122,6 +125,10 @@ export function buildNodes(params, network, watchAddress, receiver) {
         label: "Balance Gate",
         description: `only proceed if balance > ${params.balance_threshold_eth} ETH`,
         config: {
+          // Condition nodes are type:"action" with actionType:"Condition" and a
+          // SINGLE JS expression string. A structured {logicalOperator,
+          // conditions:[]} object is accepted at create time and then SILENTLY
+          // PRUNED at runtime while execution still reports "success".
           actionType: "Condition",
           condition: `{{@check-balance:Check Balance.balance}} > ${parseFloat(params.balance_threshold_eth)}`,
         },
@@ -134,6 +141,7 @@ export function buildNodes(params, network, watchAddress, receiver) {
       position: { x: 0, y: 450 },
       data: {
         label: "Safe Transfer", description: `send ${params.transfer_amount_eth} ETH only when the gate passes`, type: "action",
+        // the recipient field is `recipientAddress`, NOT `to`
         config: { actionType: "web3/transfer-funds", network: String(network), recipientAddress: receiver, amount: params.transfer_amount_eth }, status: "idle",
       },
     },
@@ -141,12 +149,16 @@ export function buildNodes(params, network, watchAddress, receiver) {
   const edges = [
     { id: "e1", source: "trigger", target: "check-balance" },
     { id: "e2", source: "check-balance", target: "gate" },
+    // sourceHandle is ONLY for Condition and For Each edges
     { id: "e3", source: "gate", target: "safe-transfer", sourceHandle: "true" },
   ];
   return { nodes, edges };
 }
 
 // ---------- failure classification ----------
+// template-level errors (node types, schema, config shape) are NOT fixable by
+// re-drafting parameters. healing them just burns Claude calls against the
+// wrong layer. classify first, heal only what healing can reach.
 export function classifyFailure(errJson) {
   const text = JSON.stringify(errJson || "").toLowerCase();
   const templateSignals = [
@@ -156,6 +168,8 @@ export function classifyFailure(errJson) {
   return templateSignals.some((s) => text.includes(s)) ? "TEMPLATE" : "PARAMETER";
 }
 
+// collect every nodeId that appears anywhere in an execution's status/logs,
+// so we can verify which graph nodes actually ran vs were silently dropped.
 export function collectExecutedNodeIds(obj, found = new Set()) {
   if (!obj || typeof obj !== "object") return found;
   for (const [k, v] of Object.entries(obj)) {
@@ -166,7 +180,8 @@ export function collectExecutedNodeIds(obj, found = new Set()) {
 }
 
 // ---------- pipeline steps against KeeperHub ----------
-// create requires name, nodes, and edges in the SAME call.
+// create requires name, nodes, and edges in the SAME call (create-then-patch is
+// rejected with "Name, nodes, and edges are required").
 // enabled MUST be passed true: KeeperHub creates workflows DISABLED by default,
 // and a disabled workflow 503s every marketplace call even while listed.
 export async function createWorkflow(name, description, nodes, edges) {
@@ -179,9 +194,21 @@ export async function patchWorkflow(workflowId, nodes, edges) {
   return kh(`/api/workflows/${workflowId}`, "PATCH", { nodes, edges });
 }
 
+// there is no REST validate endpoint. 404 means "not found", 405 means "method
+// not allowed on this path" — both mean the same thing here: the endpoint does
+// not exist. Treating 405 as a real failure burns a heal attempt correcting
+// parameters that were never wrong. Execution + the integrity check are the
+// actual validation gate.
 export async function validateWorkflow(workflowId) {
   const r = await kh(`/api/workflows/${workflowId}/validate`, "POST", {});
-  if (r.status === 404) return { ok: true, status: 404, json: { note: "no REST validate endpoint found, relying on execute as the validation gate" }, skipped: true };
+  if (r.status === 404 || r.status === 405) {
+    return {
+      ok: true,
+      status: r.status,
+      json: { note: `no REST validate endpoint (${r.status}), relying on execute + integrity check as the validation gate` },
+      skipped: true,
+    };
+  }
   return r;
 }
 
@@ -205,18 +232,20 @@ export async function pollExecution(executionId, tries = 20) {
 }
 
 /**
- * PUBLISH — the sequence that actually produces a callable, paid listing.
+ * PUBLISH — the sequence that actually produces a callable, PAID listing.
  *
- * Four separate facts, each of which silently breaks the listing on its own:
- *   1. enabled defaults to false. A disabled workflow 503s every call.
- *   2. list_workflow accepts NO price field. Listing at "no price" returns 200
- *      and executes for free instead of issuing a 402.
- *   3. price lives on update_workflow_listing as priceUsdcPerCall.
- *   4. priceUsdcPerCall must be a STRING, and cannot be set while listed.
+ * Four independent facts, each of which silently kills the listing on its own:
+ *   1. `enabled` defaults to false. A disabled workflow 503s every call with
+ *      "the workflow owner has disabled this workflow", even while listed.
+ *   2. `list_workflow` accepts NO price field. A listing with no price returns
+ *      200 and EXECUTES FOR FREE instead of issuing a 402 challenge.
+ *   3. Price lives on `update_workflow_listing` as `priceUsdcPerCall`.
+ *   4. `priceUsdcPerCall` must be a STRING ("0.05", not 0.05), and cannot be
+ *      changed while listed — so unlist first.
  *
- * So: enable -> unlist (if listed) -> set string price -> list -> verify.
- * Every step is a KeeperHub MCP tool call, and the result is verified by
- * reading the public listing back rather than trusting the write responses.
+ * Sequence: enable -> unlist (if listed) -> set string price -> list -> verify.
+ * Verification reads the PUBLIC listing back rather than trusting the write
+ * responses, because a write can return 200 without the field taking effect.
  */
 export async function publishWorkflow({ workflowId, params, priceUsd, apiKey = process.env.KEEPERHUB_API_KEY } = {}) {
   const id = String(workflowId);
@@ -233,8 +262,9 @@ export async function publishWorkflow({ workflowId, params, priceUsd, apiKey = p
   // 1. enable
   const enabled = await step("enable", "update_workflow", { workflowId: id, enabled: true });
 
-  // 2. unlist first if it is already listed, because price is immutable while listed
-  const current = enabled.parsed || (await step("read", "get_workflow", { workflowId: id })).parsed;
+  // 2. unlist first if already listed — price is immutable while listed
+  let current = enabled.parsed;
+  if (!current) current = (await step("read", "get_workflow", { workflowId: id })).parsed;
   if (current?.isListed) await step("unlist", "unlist_workflow", { workflowId: id });
 
   // 3. price, as a STRING
@@ -249,7 +279,7 @@ export async function publishWorkflow({ workflowId, params, priceUsd, apiKey = p
 
   const finalSlug = listed.parsed?.listedSlug || slug;
 
-  // 5. verify against the PUBLIC listing, not the write response
+  // 5. verify against the PUBLIC listing (no auth required), not the writes
   const check = await step("verify", "get_workflow_listing", { slug: finalSlug });
   const v = check.parsed || {};
   const priceOk = v.priceUsdcPerCall === price;
@@ -279,6 +309,6 @@ export async function publishWorkflow({ workflowId, params, priceUsd, apiKey = p
   };
 }
 
-// kept as a thin alias so nothing that imports the old name breaks
+// thin alias so anything importing the old name keeps working
 export const listWorkflow = (workflowId, params, priceUsd) =>
   publishWorkflow({ workflowId, params, priceUsd });

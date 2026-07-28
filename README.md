@@ -1,41 +1,51 @@
-# keeper-agent (milestone 2)
+# keeper-agent
 
-an agent that turns evidenced demand into monetized onchain infrastructure. it refuses to build without evidence, refuses to publish outside its risk policy, heals its own drafting errors against KeeperHub's responses, proves every workflow with a real transaction before listing it, and earns when a genuinely separate identity pays via x402. every claim is anchored to a KeeperHub execution id or tx hash in a provenance certificate.
+An agent that finds a gap, builds a KeeperHub workflow to fill it, proves the
+workflow works with a real onchain transaction, publishes it to the marketplace
+at a price, and then gets paid for it by a different wallet.
 
-## the loop
+Producer and consumer, one runtime, all settled onchain.
 
-demand ledger (Supabase) -> evidence gate (3+ events, no invention) -> Claude drafts parameters only (fixed node template, no free-form graphs) -> deterministic risk policy in code (testnet only, capped amounts, auto-reject approvals/writes) -> create + validate on KeeperHub, self-heal max 2 attempts -> real self-test execution (tx #1) -> publish at $0.05+ (KeeperHub's own anti-self-dealing floor) -> second identity pays via x402 (tx #2) -> provenance certificate links all of it.
+Built for the KeeperHub Agents Onchain Hackathon.
 
-## new env vars (add in Railway on top of milestone 1)
+---
 
-- `ANTHROPIC_API_KEY` = Claude api key (console.anthropic.com), used for drafting + healing
-- `BUYER_PRIVATE_KEY` = private key of a SEPARATE wallet used only as the buyer. fund it with testnet USDC only. never reuse the creator identity.
-- `WORKFLOW_PRICE_USD` = 0.05 (default)
-- `DEMAND_THRESHOLD` = 3 (default)
+## The claim, and the proof
 
-## setup delta from milestone 1
+Every hash below is real and independently verifiable. Nothing is mocked.
 
-1. paste `schema_v2.sql` into the Supabase SQL editor and run it
-2. add the four new env vars in Railway
-3. push the new files: `index.js`, `pipeline.js`, `buyer.js`, `package.json`
+### Autonomous run
 
-## the run order (all urls, replace YOURAPP and SECRET)
+One call to `/run/factory` produced a live, priced, callable marketplace listing.
+A separate wallet then paid it.
 
-1. `/health` — confirm the two new keys show "set"
-2. `/ledger/seed?secret=SECRET` — seed 3 labeled demo demand events (or log real ones via `/ledger/log?secret=..&raw=..&need=checked-transfer&reason=..`)
-3. `/ledger?secret=SECRET` — see the evidence, grouped
-4. `/run/factory?secret=SECRET` — THE run. drafts, risk-checks, heals, self-tests with a real tx, publishes. returns the provenance id, the tx link, and the listing slug
-5. `/run/buyer?secret=SECRET&slug=THE_SLUG` — the second identity pays and calls it
-6. `/provenance/PROV_ID?secret=SECRET` — the birth certificate: why it exists, how it was built, proof it works, proof it earns
-7. `/` — glass-box live terminal (paste the secret in the input, it polls runs every 3s)
+| Step | Network | Transaction |
+|---|---|---|
+| Self-test execution | Sepolia | [`0x01dfb68f…766cc8`](https://sepolia.etherscan.io/tx/0x01dfb68fbbf13697a261247a3120ca91b18964de8908da07ef43a75042766cc8) |
+| **x402 payment settlement** | **Base mainnet** | [`0xe8b92beb…0a0852`](https://basescan.org/tx/0xe8b92beb62c3fa6757aaea9ff9977642a3de08bc140b5bae1cf6c81d050a0852) |
+| The execution that payment bought | Sepolia | [`0xf12fa4a1…318c5a`](https://sepolia.etherscan.io/tx/0xf12fa4a1c9a0676ba300a1bd0ec6f140703c47249b25d8ee417f1825a1318c5a) |
 
-## honesty notes
+Workflow `gxjrcjgs8gyq6sbud5jp1`, listed as `checked-transfer-2bet` at $0.05 USDC per call.
 
-- seeded demand events are labeled `source: 'seeded'` and shown as such. real logged ones are `'live'`.
-- the factory refuses to run below the evidence threshold (HTTP 412), refuses risk-policy violations (HTTP 403), and refuses to publish a workflow whose self-test did not succeed.
-- two calls are flagged least-verified against docs and log their raw responses for a one-round fix if the field names differ: `POST /api/workflows/{id}/validate` and `POST /api/workflows/{id}/list`. if either 4xxs, paste the trace back into chat.
-- the buyer probes the 402 challenge first and returns it raw, so if the x402 protocol version differs, the fix is visible instead of guessed.
+A second autonomous run, `checked-transfer-g63s` (workflow `q681buludh0q3mmu72ags`),
+self-tested at [`0x3c80e6b2…86de48`](https://sepolia.etherscan.io/tx/0x3c80e6b29284444daf061eccf13d12c251d09407bd0416c112fc2c1d8d86de48)
+and is live and charging now.
 
-## debugging
+### The two identities
 
-every endpoint returns a `trace` array with raw KeeperHub responses, and every run is stored in Supabase. copy the json back into the Claude chat. that is the loop.
+| Role | Address |
+|---|---|
+| Creator (receives payment) | `0xc68f0E22Dc6eD7e883873B36f23DdBBC1b3968Ac` |
+| Buyer (sends payment) | `0x0Aab4edD80E3723D10A636EDCcc7A5b66275b1E0` |
+| x402 facilitator (submits tx, pays gas) | `0xB87E1A2cc2B4643F2892768e80e41167F17C5860` |
+
+Read the BaseScan page for the settlement: the transaction is submitted by the
+facilitator, the USDC moves buyer → creator, and the buyer pays zero gas. That
+is EIP-3009 `TransferWithAuthorization` doing what it is supposed to do.
+
+---
+
+## Verify it yourself
+
+The service is live. Replace `$RUN_SECRET` with the secret shared in the
+submission notes.

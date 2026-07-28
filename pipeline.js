@@ -1,10 +1,11 @@
 // pipeline.js | milestone 2
 // the factory: demand evidence -> Claude drafts params -> deterministic template
-// -> risk policy -> validate -> self-heal (capped) -> simulate -> real self-test tx
+// -> risk policy -> validate -> self-heal (capped) -> real self-test tx
 // -> publish to marketplace. LLM proposes, system normalizes, KeeperHub executes.
 
+import { mcpCallTool } from "./mcp.js";
+
 const KH = "https://app.keeperhub.com";
-const MAX_HEAL_ATTEMPTS = 2;
 
 // ---------- KeeperHub http ----------
 export async function kh(path, method = "GET", body = null, apiKey = process.env.KEEPERHUB_API_KEY) {
@@ -54,7 +55,6 @@ async function askClaude(system, user) {
   return JSON.parse(clean);
 }
 
-// Claude only fills PARAMETERS. the node graph itself is a fixed template.
 const DRAFT_SYSTEM = `you are a parameter compiler for one fixed KeeperHub workflow template: a "checked transfer" (check wallet balance, and only if it exceeds a threshold, send a tiny transfer). output RAW JSON ONLY, no markdown, no prose, matching exactly:
 {
   "workflow_name": "string, lowercase-hyphens, max 32 chars",
@@ -79,8 +79,6 @@ export async function healParams(previousParams, errorText) {
 }
 
 // ---------- deterministic risk policy ----------
-// the agent refuses to publish anything outside its autonomous budget.
-// this runs in code, not in the LLM, so it cannot be talked out of it.
 const TESTNETS = ["11155111", "84532"];
 export function riskCheck(params, network) {
   const rejections = [];
@@ -149,9 +147,6 @@ export function buildNodes(params, network, watchAddress, receiver) {
 }
 
 // ---------- failure classification ----------
-// template-level errors (node types, schema, config shape) are NOT fixable by
-// re-drafting parameters. healing them just burns Claude calls against the
-// wrong layer. classify first, heal only what healing can reach.
 export function classifyFailure(errJson) {
   const text = JSON.stringify(errJson || "").toLowerCase();
   const templateSignals = [
@@ -161,8 +156,6 @@ export function classifyFailure(errJson) {
   return templateSignals.some((s) => text.includes(s)) ? "TEMPLATE" : "PARAMETER";
 }
 
-// collect every nodeId that appears anywhere in an execution's status/logs,
-// so we can verify which graph nodes actually ran vs were silently dropped.
 export function collectExecutedNodeIds(obj, found = new Set()) {
   if (!obj || typeof obj !== "object") return found;
   for (const [k, v] of Object.entries(obj)) {
@@ -173,12 +166,11 @@ export function collectExecutedNodeIds(obj, found = new Set()) {
 }
 
 // ---------- pipeline steps against KeeperHub ----------
-// KeeperHub's real create endpoint requires name, nodes, and edges together
-// in the initial call (confirmed by the 400 "Name, nodes, and edges are
-// required" response) rather than accepting an empty shell to be patched
-// afterward. nodes/edges are now required params here.
+// create requires name, nodes, and edges in the SAME call.
+// enabled MUST be passed true: KeeperHub creates workflows DISABLED by default,
+// and a disabled workflow 503s every marketplace call even while listed.
 export async function createWorkflow(name, description, nodes, edges) {
-  const r = await kh("/api/workflows/create", "POST", { name, description, nodes, edges });
+  const r = await kh("/api/workflows/create", "POST", { name, description, nodes, edges, enabled: true });
   const id = r.json?.id || r.json?.workflow?.id || r.json?.data?.id || r.json?.workflowId;
   return { ...r, workflowId: id };
 }
@@ -187,12 +179,9 @@ export async function patchWorkflow(workflowId, nodes, edges) {
   return kh(`/api/workflows/${workflowId}`, "PATCH", { nodes, edges });
 }
 
-// validation: REST path for this is unverified in docs. we try the likely path,
-// and if it 404s we fall through, because simulate + execute is itself a
-// real validation gate. the raw response is kept either way.
 export async function validateWorkflow(workflowId) {
   const r = await kh(`/api/workflows/${workflowId}/validate`, "POST", {});
-  if (r.status === 404) return { ok: true, status: 404, json: { note: "no REST validate endpoint found, relying on simulate as the validation gate" }, skipped: true };
+  if (r.status === 404) return { ok: true, status: 404, json: { note: "no REST validate endpoint found, relying on execute as the validation gate" }, skipped: true };
   return r;
 }
 
@@ -215,18 +204,81 @@ export async function pollExecution(executionId, tries = 20) {
   return { finalStatus, statusBody, logs: logs.json };
 }
 
-// publish: discovered via live probe, NOT a separate endpoint. listing is a
-// PATCH on the workflow itself with isListed/listedSlug/price, and the API
-// requires an inputSchema (json-schema object; {"type":"object"} is valid for
-// no-input workflows) — KeeperHub's own 422 error documented this for us.
-export async function listWorkflow(workflowId, params, priceUsd) {
+/**
+ * PUBLISH — the sequence that actually produces a callable, paid listing.
+ *
+ * Four separate facts, each of which silently breaks the listing on its own:
+ *   1. enabled defaults to false. A disabled workflow 503s every call.
+ *   2. list_workflow accepts NO price field. Listing at "no price" returns 200
+ *      and executes for free instead of issuing a 402.
+ *   3. price lives on update_workflow_listing as priceUsdcPerCall.
+ *   4. priceUsdcPerCall must be a STRING, and cannot be set while listed.
+ *
+ * So: enable -> unlist (if listed) -> set string price -> list -> verify.
+ * Every step is a KeeperHub MCP tool call, and the result is verified by
+ * reading the public listing back rather than trusting the write responses.
+ */
+export async function publishWorkflow({ workflowId, params, priceUsd, apiKey = process.env.KEEPERHUB_API_KEY } = {}) {
+  const id = String(workflowId);
   const slug = `${params.workflow_name}-${Date.now().toString(36).slice(-4)}`;
-  const body = {
-    isListed: true,
-    listedSlug: slug,
-    price: String(priceUsd),
-    inputSchema: { type: "object" },
+  const price = String(priceUsd);
+  const steps = [];
+
+  const step = async (label, tool, args) => {
+    const r = await mcpCallTool({ tool, args, apiKey });
+    steps.push({ label, tool, args, ok: r.ok, error: r.ok ? null : (r.text?.[0] || r.rpc_error) });
+    return r;
   };
-  const r = await kh(`/api/workflows/${workflowId}`, "PATCH", body);
-  return { ...r, requested: body, slug };
+
+  // 1. enable
+  const enabled = await step("enable", "update_workflow", { workflowId: id, enabled: true });
+
+  // 2. unlist first if it is already listed, because price is immutable while listed
+  const current = enabled.parsed || (await step("read", "get_workflow", { workflowId: id })).parsed;
+  if (current?.isListed) await step("unlist", "unlist_workflow", { workflowId: id });
+
+  // 3. price, as a STRING
+  const priced = await step("set_price", "update_workflow_listing", { workflowId: id, priceUsdcPerCall: price });
+
+  // 4. list
+  const listed = await step("list", "list_workflow", {
+    workflowId: id,
+    slug,
+    inputSchema: { type: "object" },
+  });
+
+  const finalSlug = listed.parsed?.listedSlug || slug;
+
+  // 5. verify against the PUBLIC listing, not the write response
+  const check = await step("verify", "get_workflow_listing", { slug: finalSlug });
+  const v = check.parsed || {};
+  const priceOk = v.priceUsdcPerCall === price;
+  const listedOk = v.isListed === true;
+  const enabledOk = (enabled.parsed?.enabled ?? listed.parsed?.enabled) === true;
+
+  return {
+    ok: priceOk && listedOk && enabledOk,
+    slug: finalSlug,
+    requested: { enabled: true, priceUsdcPerCall: price, isListed: true },
+    verified: {
+      enabled: enabledOk,
+      isListed: listedOk,
+      priceUsdcPerCall: v.priceUsdcPerCall ?? null,
+      priceMatches: priceOk,
+    },
+    summary: {
+      slug: finalSlug,
+      enable_ok: enabled.ok,
+      price_ok: priced.ok,
+      list_ok: listed.ok,
+      verified_price: v.priceUsdcPerCall ?? null,
+      verified_listed: v.isListed ?? null,
+    },
+    steps,
+    listing: v,
+  };
 }
+
+// kept as a thin alias so nothing that imports the old name breaks
+export const listWorkflow = (workflowId, params, priceUsd) =>
+  publishWorkflow({ workflowId, params, priceUsd });

@@ -1,17 +1,20 @@
 // keeper-agent | milestone 2
-// core: /health /run/pipeline-test /run/transfer /runs /ledger* /run/factory /provenance/:id /
-// discovery: /discover /debug/kh-proxy
-// x402: /x402/sweep /x402/probe /x402/pay
-// mcp:  /mcp/init /mcp/tools /mcp/call /mcp/enable
+// core:      /health /run/pipeline-test /run/transfer /runs
+// ledger:    /ledger /ledger/log /ledger/seed
+// factory:   /run/factory /provenance/:id
+// x402:      /x402/sweep /x402/probe /x402/pay /run/buyer
+// mcp:       /mcp/init /mcp/tools /mcp/call /mcp/enable
+// survey:    /survey /survey/slugs   (only if survey.js is present)
+// glass box: /
 
 import express from "express";
 import { createClient } from "@supabase/supabase-js";
 import {
   kh, deepFind, draftParams, healParams, riskCheck, buildNodes, classifyFailure, collectExecutedNodeIds,
-  createWorkflow, patchWorkflow, validateWorkflow, executeWorkflow, pollExecution, listWorkflow,
+  createWorkflow, patchWorkflow, validateWorkflow, executeWorkflow, pollExecution, publishWorkflow,
 } from "./pipeline.js";
-import { paidCall, probeChallenge, mountBuyerRoutes, REFERENCE_SLUG } from "./buyer.js";
-import { mountMcpRoutes, enableWorkflow, mcpCallTool } from "./mcp.js";
+import { paidCall, probeChallenge, mountBuyerRoutes } from "./buyer.js";
+import { mountMcpRoutes } from "./mcp.js";
 
 const {
   KEEPERHUB_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, RUN_SECRET,
@@ -212,7 +215,7 @@ app.get("/run/factory", async (req, res) => {
     for (let attempt = 0; attempt <= 2; attempt++) {
       const { nodes, edges } = buildNodes(params, TEST_NETWORK, TEST_ADDRESS, RECEIVER_ADDRESS);
       const created = await createWorkflow(params.workflow_name + "-" + Date.now().toString(36), params.listing_description.slice(0, 140), nodes, edges);
-      trace.push({ step: "create_workflow", attempt, status: created.status, body: created.json });
+      trace.push({ step: "create_workflow", attempt, status: created.status, enabled_requested: true, body: created.json });
       if (created.ok && created.workflowId) { workflowId = created.workflowId; break; }
 
       const failureClass = classifyFailure(created.json);
@@ -232,12 +235,6 @@ app.get("/run/factory", async (req, res) => {
       }
     }
     if (!workflowId) throw new Error("create failed after capped heal attempts, see trace");
-
-    // step 3b: KeeperHub creates workflows DISABLED by default. A disabled
-    // workflow can be listed and still 503 every paid call with "the workflow
-    // owner has disabled this workflow". Flip it on before anything else.
-    const enabled = await enableWorkflow({ id: workflowId, apiKey: KEEPERHUB_API_KEY });
-    trace.push({ step: "enable_workflow", ok: enabled.ok, arg_name_used: enabled.arg_name_used, body: enabled.parsed || enabled.text || enabled.rpc_error });
 
     const validated = await validateWorkflow(workflowId);
     trace.push({ step: "validate", status: validated.status, body: validated.json, skipped: !!validated.skipped });
@@ -292,18 +289,26 @@ app.get("/run/factory", async (req, res) => {
     if (!selfTestOk) throw new Error(`self-test did not succeed (${result.finalStatus})`);
     if (!integrity.pass) throw new Error(`INTEGRITY-FAIL: ${integrity.note}`);
 
-    const listed = await listWorkflow(workflowId, params, WORKFLOW_PRICE_USD);
-    trace.push({ step: "list_workflow", status: listed.status, requested: listed.requested, body: listed.json });
+    // publish: enable -> unlist -> string price -> list -> verify against the
+    // PUBLIC listing. four separate flags, each of which silently kills the
+    // listing on its own. see publishWorkflow in pipeline.js.
+    const listed = await publishWorkflow({
+      workflowId, params, priceUsd: WORKFLOW_PRICE_USD, apiKey: KEEPERHUB_API_KEY,
+    });
+    trace.push({ step: "publish", ok: listed.ok, verified: listed.verified, steps: listed.steps });
     const published = listed.ok;
 
-    // re-assert enabled after listing, then verify callability for real
-    const reEnable = await enableWorkflow({ id: workflowId, apiKey: KEEPERHUB_API_KEY });
-    trace.push({ step: "enable_after_list", ok: reEnable.ok });
-
+    // prove callability for real rather than trusting the write responses
     let callable = null;
     if (listed.slug) {
       const p = await probeChallenge({ target: listed.slug, apiKey: KEEPERHUB_API_KEY });
-      callable = { status: p.status, version: p.detected_version, price: p.offer_summary?.human_price_usdc ?? null, payTo: p.offer_summary?.payTo ?? null };
+      callable = {
+        status: p.status,
+        is_402: p.status === 402,
+        version: p.detected_version,
+        price: p.offer_summary?.human_price_usdc ?? null,
+        payTo: p.offer_summary?.payTo ?? null,
+      };
       trace.push({ step: "callability_probe", callable });
     }
 
@@ -312,24 +317,25 @@ app.get("/run/factory", async (req, res) => {
       listing_slug: listed.slug,
       price_usd: Number(WORKFLOW_PRICE_USD),
       trace,
-      error: published ? null : "listing call did not return ok, raw response in trace",
+      error: published ? null : `publish verification failed: ${JSON.stringify(listed.verified)}`,
     }).eq("id", prov.id);
 
     await supabase.from("demand_events").update({ consumed_by: prov.id }).in("id", events.map((e) => e.id));
 
     res.json({
-      result: published ? "PUBLISHED" : "SELF-TESTED, LISTING NEEDS ONE FIX",
+      result: published && callable?.is_402 ? "PUBLISHED AND CHARGING" : (published ? "PUBLISHED, NOT YET CHARGING" : "SELF-TESTED, PUBLISH FAILED"),
       provenanceId: prov.id,
       workflowId,
       selfTestTx: found.transactionHash || found.txHash || null,
       selfTestTxLink: found.transactionLink || null,
       listingSlug: listed.slug,
       priceUsd: WORKFLOW_PRICE_USD,
-      healAttempts: healLog.length,
+      publishVerified: listed.verified,
       callable,
-      nextStep: callable?.status === 402
+      healAttempts: healLog.length,
+      nextStep: callable?.is_402
         ? `/x402/pay?secret=...&target=${listed.slug}`
-        : `/mcp/enable?secret=...&id=${workflowId}&slug=${listed.slug}`,
+        : "read trace.publish.steps for the failing tool call",
       trace,
     });
   } catch (err) {
@@ -338,7 +344,7 @@ app.get("/run/factory", async (req, res) => {
   }
 });
 
-// legacy alias, kept so old URLs still work
+// legacy alias, kept so older URLs still work
 app.get("/run/buyer", async (req, res) => {
   if (!guard(req, res)) return;
   const slug = req.query.slug;
@@ -404,7 +410,6 @@ app.get("/discover", async (req, res) => {
       totalChars: raw.length,
       topLevelKeys: schemas.json && typeof schemas.json === "object" ? Object.keys(schemas.json) : null,
       conditionExcerpt: raw.match(/.{0,400}Condition.{0,800}/)?.[0] || "no 'Condition' match",
-      listingExcerpt: raw.match(/.{0,300}(list_workflow|marketplace|listing).{0,700}/i)?.[0] || "no listing match",
       note: "add &full=1 for the complete raw registry",
     };
   }
@@ -427,7 +432,7 @@ app.get("/discover", async (req, res) => {
   out.workflows = {
     status: wfs.status,
     count: Array.isArray(wfArr) ? wfArr.length : "unknown shape",
-    all: Array.isArray(wfArr) ? wfArr.map((w) => ({ id: w.id, name: w.name, enabled: w.enabled, visibility: w.visibility, isListed: w.isListed, listedSlug: w.listedSlug })) : wfs.json,
+    all: Array.isArray(wfArr) ? wfArr.map((w) => ({ id: w.id, name: w.name, enabled: w.enabled, visibility: w.visibility, isListed: w.isListed, listedSlug: w.listedSlug, priceUsdcPerCall: w.priceUsdcPerCall })) : wfs.json,
   };
 
   res.json(out);
@@ -469,5 +474,14 @@ setInterval(tick,3000);tick();
 
 mountBuyerRoutes(app, { guard, logRun, apiKey: KEEPERHUB_API_KEY });
 mountMcpRoutes(app, { guard, apiKey: KEEPERHUB_API_KEY });
+
+// survey.js is optional. if the file is not in the repo, the app still boots.
+try {
+  const { mountSurveyRoutes } = await import("./survey.js");
+  mountSurveyRoutes(app, { guard, apiKey: KEEPERHUB_API_KEY });
+  console.log("survey routes mounted");
+} catch {
+  console.log("survey.js not present, skipping /survey routes");
+}
 
 app.listen(PORT, () => console.log(`keeper-agent m2 listening on ${PORT}`));

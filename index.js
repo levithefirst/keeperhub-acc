@@ -5,6 +5,8 @@
 // x402:      /x402/sweep /x402/probe /x402/pay /run/buyer
 // mcp:       /mcp/init /mcp/tools /mcp/call /mcp/enable
 // survey:    /survey /survey/slugs   (only if survey.js is present)
+// status:    /status
+// demo:      /demo
 // glass box: /
 
 import express from "express";
@@ -15,6 +17,8 @@ import {
 } from "./pipeline.js";
 import { paidCall, probeChallenge, mountBuyerRoutes } from "./buyer.js";
 import { mountMcpRoutes } from "./mcp.js";
+import { mountDemoRoute } from "./demo.js";
+import { mountHealthRoutes } from "./health.js";
 
 const {
   KEEPERHUB_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, RUN_SECRET,
@@ -289,16 +293,12 @@ app.get("/run/factory", async (req, res) => {
     if (!selfTestOk) throw new Error(`self-test did not succeed (${result.finalStatus})`);
     if (!integrity.pass) throw new Error(`INTEGRITY-FAIL: ${integrity.note}`);
 
-    // publish: enable -> unlist -> string price -> list -> verify against the
-    // PUBLIC listing. four separate flags, each of which silently kills the
-    // listing on its own. see publishWorkflow in pipeline.js.
     const listed = await publishWorkflow({
       workflowId, params, priceUsd: WORKFLOW_PRICE_USD, apiKey: KEEPERHUB_API_KEY,
     });
     trace.push({ step: "publish", ok: listed.ok, verified: listed.verified, steps: listed.steps });
     const published = listed.ok;
 
-    // prove callability for real rather than trusting the write responses
     let callable = null;
     if (listed.slug) {
       const p = await probeChallenge({ target: listed.slug, apiKey: KEEPERHUB_API_KEY });
@@ -474,6 +474,8 @@ setInterval(tick,3000);tick();
 
 mountBuyerRoutes(app, { guard, logRun, apiKey: KEEPERHUB_API_KEY });
 mountMcpRoutes(app, { guard, apiKey: KEEPERHUB_API_KEY });
+mountDemoRoute(app);
+mountHealthRoutes(app, { apiKey: KEEPERHUB_API_KEY });
 
 // survey.js is optional. if the file is not in the repo, the app still boots.
 try {

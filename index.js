@@ -265,8 +265,6 @@ app.get("/run/factory", async (req, res) => {
     const found = deepFind({ s: result.statusBody, l: result.logs }, ["transactionHash", "transactionLink", "txHash"]);
     const selfTestOk = ["success", "completed"].includes(result.finalStatus);
 
-    // integrity: KeeperHub can accept an invalid node, silently prune it at
-    // runtime, and still report "success". compare graph against executed nodes.
     const { nodes: builtNodes } = buildNodes(params, TEST_NETWORK, TEST_ADDRESS, RECEIVER_ADDRESS);
     const expectedIds = builtNodes.map((n) => n.id);
     const executedIds = [...collectExecutedNodeIds({ s: result.statusBody, l: result.logs })];
@@ -477,6 +475,7 @@ setInterval(tick,3000);tick();
 mountBuyerRoutes(app, { guard, logRun, apiKey: KEEPERHUB_API_KEY });
 mountMcpRoutes(app, { guard, apiKey: KEEPERHUB_API_KEY });
 mountLandingRoute(app);
+mountDemoRoute(app);
 
 // survey.js is optional. if the file is not in the repo, the app still boots.
 try {

@@ -7,6 +7,7 @@
 // survey:    /survey /survey/slugs   (only if survey.js is present)
 // status:    /status
 // demo:      /demo
+// landing:   /landing
 // glass box: /
 
 import express from "express";
@@ -19,6 +20,7 @@ import { paidCall, probeChallenge, mountBuyerRoutes } from "./buyer.js";
 import { mountMcpRoutes } from "./mcp.js";
 import { mountDemoRoute } from "./demo.js";
 import { mountHealthRoutes } from "./health.js";
+import { mountLandingRoute } from "./landing.js";
 
 const {
   KEEPERHUB_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, RUN_SECRET,
@@ -474,8 +476,7 @@ setInterval(tick,3000);tick();
 
 mountBuyerRoutes(app, { guard, logRun, apiKey: KEEPERHUB_API_KEY });
 mountMcpRoutes(app, { guard, apiKey: KEEPERHUB_API_KEY });
-mountDemoRoute(app);
-mountHealthRoutes(app, { apiKey: KEEPERHUB_API_KEY });
+mountLandingRoute(app);
 
 // survey.js is optional. if the file is not in the repo, the app still boots.
 try {

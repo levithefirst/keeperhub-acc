@@ -1,7 +1,5 @@
-// landing.js — hero screen for the demo video's opening shot, now also a
-// real entry point into the product via a CTA button. Matches /demo's
-// matte-emerald theme with a bit more visual presence: ambient glow,
-// a subtle framed badge, and a button that leads straight into /demo.
+// landing.js — hero screen for the demo video's opening shot, also a real
+// entry point into the product via a CTA button. Matte-emerald theme.
 
 export function mountLandingRoute(app) {
   app.get("/landing", (req, res) => {
@@ -69,7 +67,7 @@ export function mountLandingRoute(app) {
 '</style></head><body>' +
 '<div class="wrap">' +
 '<span class="badge"><i></i>Live on Base mainnet</span>' +
-'<h1>An agent that builds, verifies, lists, and sells onchain workflows<span class="dim"> — then gets paid by a separate wallet.</span></h1>' +
+'<h1>An agent that builds, verifies, lists, and sells onchain workflows, <span class="dim">then gets paid by a separate wallet.</span></h1>' +
 '<p class="lede">No human clicks anything after start. The agent checks its own work before it publishes.</p>' +
 '<div class="cta-row">' +
 '<a class="cta" href="/demo">Run the live demo' +
